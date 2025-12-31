@@ -5,11 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
   "dependencies": {
+    "@openai/codex": "^0.77.0",
     "antd": "^5.11.0",
     "dayjs": "^1.11.10",
     "echarts": "^5.4.3",

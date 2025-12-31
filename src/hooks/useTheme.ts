@@ -1,33 +1,23 @@
-import { useState, useCallback, useEffect } from 'react';
-import { VersionType } from '../types';
+import { useCallback } from 'react';
 
 export function useTheme() {
-  const [version, setVersion] = useState<VersionType>('v1');
+  const version = 'v2' as const;
 
-  // Load version from localStorage on mount
-  useEffect(() => {
-    const savedVersion = localStorage.getItem('bi-version') as VersionType | null;
-    if (savedVersion && (savedVersion === 'v1' || savedVersion === 'v2')) {
-      setVersion(savedVersion);
-    }
-  }, []);
-
-  const switchVersion = useCallback((newVersion: VersionType) => {
-    setVersion(newVersion);
-    localStorage.setItem('bi-version', newVersion);
+  const switchVersion = useCallback(() => {
+    // 强制不允许切换
+    localStorage.setItem('bi-version', 'v2');
   }, []);
 
   const toggleVersion = useCallback(() => {
-    const newVersion = version === 'v1' ? 'v2' : 'v1';
-    switchVersion(newVersion);
-  }, [version, switchVersion]);
+    localStorage.setItem('bi-version', 'v2');
+  }, []);
 
   return {
     version,
     switchVersion,
     toggleVersion,
-    isV1: version === 'v1',
-    isV2: version === 'v2'
+    isV1: false,
+    isV2: true
   };
 }
 

@@ -1,4 +1,6 @@
 # Logs
+#
+offline-images.tar
 logs
 *.log
 npm-debug.log*

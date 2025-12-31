@@ -177,3 +177,35 @@ MIT
 
 如有问题或建议，请提交Issue或Pull Request。
 
+## 📦 离线镜像打包与启动（无需 Docker Hub）
+
+本项目已提供离线镜像包，适合在无网络环境中部署运行。
+
+### 1) 在有网环境打包镜像
+
+确保你已经构建好前端和后端镜像，然后导出所有运行所需镜像：
+
+```bash
+docker save -o offline-images.tar redis:7-alpine backend-producer mysql:8.0 confluentinc/cp-kafka:7.4.0 backend-frontend backend-api backend-spark-consumer confluentinc/cp-zookeeper:7.4.0
+```
+
+将以下内容通过 U 盘拷贝到目标机器：
+- 项目仓库完整目录
+- `offline-images.tar`
+
+### 2) 在离线机器加载镜像并启动
+
+在目标机器中，进入项目目录后执行：
+
+```bash
+docker load -i offline-images.tar
+docker compose -f backend/docker-compose.yml up -d --no-build --pull=never
+```
+
+### 3) 访问地址
+
+前端默认端口为 `80`，浏览器访问：
+
+```
+http://localhost/
+```
