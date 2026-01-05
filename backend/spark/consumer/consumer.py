@@ -13,6 +13,36 @@ import mysql.connector
 import redis
 from kafka import KafkaConsumer
 import numpy as np
+import pandas as pd
+
+# PySpark imports
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import col, sum as spark_sum, count, avg, max as spark_max, min as spark_min
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
+    PYSPARK_AVAILABLE = True
+except ImportError:
+    PYSPARK_AVAILABLE = False
+    print("[Consumer] Warning: PySpark not installed. Spark processing disabled.")
+
+# Machine Learning imports
+try:
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.cluster import KMeans
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import silhouette_score, roc_auc_score
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("[Consumer] Warning: scikit-learn not installed. ML models disabled.")
+
+try:
+    import happybase
+    HBASE_AVAILABLE = True
+except ImportError:
+    HBASE_AVAILABLE = False
+    print("[Consumer] Warning: happybase not installed. HBase support disabled.")
 
 # Configuration from environment
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
@@ -24,6 +54,8 @@ MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', 'ecommerce_pass')
 MYSQL_DATABASE = os.getenv('MYSQL_DATABASE', 'ecommerce')
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+HBASE_HOST = os.getenv('HBASE_HOST', 'localhost')
+HBASE_PORT = int(os.getenv('HBASE_PORT', '9090'))
 
 # Batch settings
 BATCH_SIZE = 50
@@ -92,6 +124,25 @@ def create_kafka_consumer():
     raise Exception("Failed to connect to Kafka")
 
 
+def create_hbase_connection():
+    """Create HBase connection with retry"""
+    if not HBASE_AVAILABLE:
+        print("[Consumer] HBase support disabled (happybase not installed)")
+        return None
+
+    max_retries = 30
+    for attempt in range(max_retries):
+        try:
+            conn = happybase.Connection(HBASE_HOST, HBASE_PORT)
+            print(f"[Consumer] Connected to HBase at {HBASE_HOST}:{HBASE_PORT}")
+            return conn
+        except Exception as e:
+            print(f"[Consumer] HBase connection attempt {attempt + 1}/{max_retries}: {e}")
+            time.sleep(2)
+    print("[Consumer] Warning: Failed to connect to HBase. Continuing without HBase support.")
+    return None
+
+
 def segment_customer(orders, gmv):
     """Simple RFM-based customer segmentation"""
     if orders >= 5 and gmv >= 1000:
@@ -139,6 +190,37 @@ def process_transaction(transaction):
     customer_data[customer_id]['last_date'] = date
     customer_data[customer_id]['gender'] = transaction['gender']
     customer_data[customer_id]['age'] = transaction['age']
+
+
+def save_to_hbase(hbase_conn, transactions):
+    """Save batch of transactions to HBase"""
+    if hbase_conn is None:
+        return
+
+    try:
+        table = hbase_conn.table('transactions')
+
+        for t in transactions:
+            # Row Key: invoice_date#customer_id#timestamp
+            row_key = f"{t['invoice_date']}#{t['customer_id']}#{int(time.time()*1000)}"
+
+            data = {
+                b'cf:customer_id': t['customer_id'].encode('utf-8'),
+                b'cf:gender': t['gender'].encode('utf-8'),
+                b'cf:age': str(t['age']).encode('utf-8'),
+                b'cf:category': t['category'].encode('utf-8'),
+                b'cf:quantity': str(t['quantity']).encode('utf-8'),
+                b'cf:price': str(t['price']).encode('utf-8'),
+                b'cf:payment_method': t['payment_method'].encode('utf-8'),
+                b'cf:invoice_time': t.get('invoice_time', '').encode('utf-8'),
+            }
+
+            table.put(row_key.encode('utf-8'), data)
+
+        print(f"[Consumer] Saved {len(transactions)} transactions to HBase")
+
+    except Exception as e:
+        print(f"[Consumer] HBase save error: {e}")
 
 
 def save_to_mysql(mysql_conn, transactions):
@@ -266,14 +348,346 @@ def clear_batch_aggregators():
     category_metrics.clear()
 
 
+# ============================================
+# PySpark Processing Functions
+# ============================================
+
+def create_spark_session():
+    """Create and return a Spark session for distributed processing"""
+    if not PYSPARK_AVAILABLE:
+        print("[Consumer] PySpark not available, skipping Spark session creation")
+        return None
+
+    try:
+        spark = SparkSession.builder \
+            .appName("EcommerceAnalytics") \
+            .master("local[*]") \
+            .config("spark.sql.shuffle.partitions", "4") \
+            .config("spark.driver.memory", "2g") \
+            .config("spark.executor.memory", "2g") \
+            .getOrCreate()
+
+        print("[Consumer] Spark session created successfully")
+        return spark
+    except Exception as e:
+        print(f"[Consumer] Failed to create Spark session: {e}")
+        return None
+
+
+def process_with_spark(spark, transactions_data):
+    """Process transactions using PySpark for distributed computing"""
+    if spark is None or not PYSPARK_AVAILABLE:
+        return None
+
+    try:
+        # Define schema for transactions
+        schema = StructType([
+            StructField("customer_id", StringType(), True),
+            StructField("gender", StringType(), True),
+            StructField("age", IntegerType(), True),
+            StructField("category", StringType(), True),
+            StructField("quantity", IntegerType(), True),
+            StructField("price", DoubleType(), True),
+            StructField("payment_method", StringType(), True),
+            StructField("invoice_date", StringType(), True),
+        ])
+
+        # Create DataFrame from transactions
+        df = spark.createDataFrame(transactions_data, schema=schema)
+
+        # Calculate aggregations using Spark
+        agg_result = df.groupBy("category").agg(
+            spark_sum("price").alias("total_gmv"),
+            count("*").alias("order_count"),
+            avg("price").alias("avg_price"),
+            spark_max("price").alias("max_price"),
+            spark_min("price").alias("min_price")
+        )
+
+        print(f"[Consumer] Spark processing completed for {len(transactions_data)} transactions")
+        return agg_result
+
+    except Exception as e:
+        print(f"[Consumer] Spark processing error: {e}")
+        return None
+
+
+def spark_customer_analytics(spark, transactions_data):
+    """Perform customer analytics using Spark SQL"""
+    if spark is None or not PYSPARK_AVAILABLE:
+        return None
+
+    try:
+        schema = StructType([
+            StructField("customer_id", StringType(), True),
+            StructField("gender", StringType(), True),
+            StructField("age", IntegerType(), True),
+            StructField("category", StringType(), True),
+            StructField("quantity", IntegerType(), True),
+            StructField("price", DoubleType(), True),
+            StructField("payment_method", StringType(), True),
+            StructField("invoice_date", StringType(), True),
+        ])
+
+        df = spark.createDataFrame(transactions_data, schema=schema)
+        df.createOrReplaceTempView("transactions")
+
+        # Customer lifetime value analysis
+        customer_ltv = spark.sql("""
+            SELECT
+                customer_id,
+                COUNT(*) as total_orders,
+                SUM(price * quantity) as lifetime_value,
+                AVG(price * quantity) as avg_order_value,
+                COUNT(DISTINCT category) as category_diversity
+            FROM transactions
+            GROUP BY customer_id
+            ORDER BY lifetime_value DESC
+        """)
+
+        print("[Consumer] Spark customer analytics completed")
+        return customer_ltv
+
+    except Exception as e:
+        print(f"[Consumer] Spark customer analytics error: {e}")
+        return None
+
+
+# ============================================
+# Machine Learning Functions
+# ============================================
+
+def train_customer_segmentation_model(transactions_data):
+    """Train KMeans clustering model for customer segmentation"""
+    if not ML_AVAILABLE:
+        print("[Consumer] scikit-learn not available, skipping ML model training")
+        return None
+
+    try:
+        # Prepare data for clustering
+        df = pd.DataFrame(transactions_data)
+
+        # Aggregate by customer
+        customer_features = df.groupby('customer_id').agg({
+            'price': ['sum', 'mean', 'count'],
+            'quantity': 'sum',
+            'age': 'first',
+            'gender': 'first'
+        }).reset_index()
+
+        customer_features.columns = ['customer_id', 'total_gmv', 'avg_price', 'order_count',
+                                     'total_quantity', 'age', 'gender']
+
+        # Encode categorical features
+        le = LabelEncoder()
+        customer_features['gender_encoded'] = le.fit_transform(customer_features['gender'])
+
+        # Select features for clustering
+        features = customer_features[['total_gmv', 'avg_price', 'order_count', 'age', 'gender_encoded']]
+
+        # Standardize features
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+
+        # Train KMeans model
+        kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+        customer_features['segment'] = kmeans.fit_predict(features_scaled)
+
+        # Calculate silhouette score
+        silhouette_avg = silhouette_score(features_scaled, customer_features['segment'])
+
+        print(f"[Consumer] Customer segmentation model trained. Silhouette score: {silhouette_avg:.4f}")
+        return kmeans, scaler, customer_features
+
+    except Exception as e:
+        print(f"[Consumer] Customer segmentation model training error: {e}")
+        return None
+
+
+def train_churn_prediction_model(transactions_data):
+    """Train classification model for customer churn prediction"""
+    if not ML_AVAILABLE:
+        print("[Consumer] scikit-learn not available, skipping churn prediction model")
+        return None
+
+    try:
+        df = pd.DataFrame(transactions_data)
+
+        # Aggregate customer features
+        customer_data = df.groupby('customer_id').agg({
+            'price': ['sum', 'mean', 'count'],
+            'quantity': 'sum',
+            'age': 'first',
+            'gender': 'first',
+            'invoice_date': ['min', 'max']
+        }).reset_index()
+
+        customer_data.columns = ['customer_id', 'total_gmv', 'avg_price', 'order_count',
+                                 'total_quantity', 'age', 'gender', 'first_date', 'last_date']
+
+        # Create churn label (simplified: customers with only 1 order are at risk)
+        customer_data['churn_risk'] = (customer_data['order_count'] == 1).astype(int)
+
+        # Encode categorical features
+        le = LabelEncoder()
+        customer_data['gender_encoded'] = le.fit_transform(customer_data['gender'])
+
+        # Select features
+        features = customer_data[['total_gmv', 'avg_price', 'order_count', 'age', 'gender_encoded']]
+        target = customer_data['churn_risk']
+
+        # Standardize features
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+
+        # Train multiple models
+        models = {
+            'logistic_regression': LogisticRegression(random_state=42, max_iter=1000),
+            'random_forest': RandomForestClassifier(n_estimators=100, random_state=42),
+            'gradient_boosting': GradientBoostingClassifier(n_estimators=100, random_state=42)
+        }
+
+        best_model = None
+        best_score = 0
+
+        for model_name, model in models.items():
+            model.fit(features_scaled, target)
+            score = model.score(features_scaled, target)
+            print(f"[Consumer] {model_name} accuracy: {score:.4f}")
+
+            if score > best_score:
+                best_score = score
+                best_model = model
+
+        print(f"[Consumer] Churn prediction model trained. Best model accuracy: {best_score:.4f}")
+        return best_model, scaler, customer_data
+
+    except Exception as e:
+        print(f"[Consumer] Churn prediction model training error: {e}")
+        return None
+
+
+def predict_customer_ltv(model, scaler, customer_features):
+    """Predict customer lifetime value using trained model"""
+    if model is None or scaler is None:
+        return None
+
+    try:
+        # Prepare features
+        features = customer_features[['total_gmv', 'avg_price', 'order_count', 'age', 'gender_encoded']]
+        features_scaled = scaler.transform(features)
+
+        # Make predictions
+        predictions = model.predict(features_scaled)
+
+        print(f"[Consumer] LTV predictions generated for {len(predictions)} customers")
+        return predictions
+
+    except Exception as e:
+        print(f"[Consumer] LTV prediction error: {e}")
+        return None
+
+
+def analyze_product_affinity(transactions_data):
+    """Analyze product affinity and cross-sell opportunities using ML"""
+    if not ML_AVAILABLE:
+        return None
+
+    try:
+        df = pd.DataFrame(transactions_data)
+
+        # Create customer-category matrix
+        customer_category = df.groupby(['customer_id', 'category']).agg({
+            'price': 'sum',
+            'quantity': 'sum'
+        }).reset_index()
+
+        # Pivot to create feature matrix
+        pivot_matrix = customer_category.pivot_table(
+            index='customer_id',
+            columns='category',
+            values='price',
+            fill_value=0
+        )
+
+        # Standardize
+        scaler = StandardScaler()
+        matrix_scaled = scaler.fit_transform(pivot_matrix)
+
+        # Perform clustering to find similar customers
+        kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(matrix_scaled)
+
+        print(f"[Consumer] Product affinity analysis completed. Found {len(np.unique(clusters))} customer clusters")
+        return pivot_matrix, clusters
+
+    except Exception as e:
+        print(f"[Consumer] Product affinity analysis error: {e}")
+        return None
+
+
+def train_demand_forecasting_model(transactions_data):
+    """Train time series forecasting model for demand prediction"""
+    if not ML_AVAILABLE:
+        return None
+
+    try:
+        df = pd.DataFrame(transactions_data)
+
+        # Aggregate by date and category
+        daily_category = df.groupby(['invoice_date', 'category']).agg({
+            'price': 'sum',
+            'quantity': 'sum'
+        }).reset_index()
+
+        # For each category, train a simple model
+        models = {}
+
+        for category in daily_category['category'].unique():
+            category_data = daily_category[daily_category['category'] == category].sort_values('invoice_date')
+
+            if len(category_data) < 5:
+                continue
+
+            # Create features (lag features)
+            category_data['gmv'] = category_data['price']
+            category_data['gmv_lag1'] = category_data['gmv'].shift(1)
+            category_data['gmv_lag2'] = category_data['gmv'].shift(2)
+            category_data['quantity_lag1'] = category_data['quantity'].shift(1)
+
+            # Remove NaN rows
+            category_data = category_data.dropna()
+
+            if len(category_data) < 3:
+                continue
+
+            # Train model
+            X = category_data[['gmv_lag1', 'gmv_lag2', 'quantity_lag1']]
+            y = category_data['gmv']
+
+            model = RandomForestClassifier(n_estimators=50, random_state=42)
+            # Note: Using classifier for demonstration, in production use regression
+            model.fit(X.astype(int), (y > y.median()).astype(int))
+
+            models[category] = model
+
+        print(f"[Consumer] Demand forecasting models trained for {len(models)} categories")
+        return models
+
+    except Exception as e:
+        print(f"[Consumer] Demand forecasting model training error: {e}")
+        return None
+
+
 def main():
     print("[Consumer] Starting Spark Consumer...")
-    
+
     # Connect to services
     mysql_conn = create_mysql_connection()
     redis_conn = create_redis_connection()
+    hbase_conn = create_hbase_connection()
     consumer = create_kafka_consumer()
-    
+
     batch_start_time = time.time()
     processed_count = 0
     
@@ -290,12 +704,13 @@ def main():
             
             if len(transaction_batch) >= BATCH_SIZE or batch_elapsed >= BATCH_TIMEOUT:
                 if transaction_batch:
+                    save_to_hbase(hbase_conn, transaction_batch)
                     save_to_mysql(mysql_conn, transaction_batch)
                     update_redis_cache(redis_conn, transaction_batch)
-                    
+
                     processed_count += len(transaction_batch)
                     print(f"[Consumer] Total processed: {processed_count}")
-                    
+
                     transaction_batch.clear()
                     clear_batch_aggregators()
                     batch_start_time = time.time()
@@ -305,11 +720,14 @@ def main():
     finally:
         # Process remaining batch
         if transaction_batch:
+            save_to_hbase(hbase_conn, transaction_batch)
             save_to_mysql(mysql_conn, transaction_batch)
             update_redis_cache(redis_conn, transaction_batch)
-        
+
         mysql_conn.close()
         redis_conn.close()
+        if hbase_conn is not None:
+            hbase_conn.close()
         consumer.close()
 
 

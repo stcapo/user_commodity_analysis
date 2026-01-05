@@ -1,12 +1,18 @@
 """
 Database Connection Module
-Provides MySQL and Redis connection utilities
+Provides MySQL, Redis, and HBase connection utilities
 """
 
 import os
 import mysql.connector
 from mysql.connector import pooling
 import redis
+
+try:
+    import happybase
+    HBASE_AVAILABLE = True
+except ImportError:
+    HBASE_AVAILABLE = False
 
 # MySQL Configuration
 MYSQL_CONFIG = {
@@ -21,6 +27,12 @@ MYSQL_CONFIG = {
 REDIS_CONFIG = {
     'host': os.getenv('REDIS_HOST', 'localhost'),
     'port': int(os.getenv('REDIS_PORT', '6379'))
+}
+
+# HBase Configuration
+HBASE_CONFIG = {
+    'host': os.getenv('HBASE_HOST', 'localhost'),
+    'port': int(os.getenv('HBASE_PORT', '9090'))
 }
 
 # Connection pool for MySQL
@@ -57,3 +69,25 @@ def get_redis_client():
             decode_responses=True
         )
     return redis_client
+
+
+# HBase client (singleton)
+hbase_connection = None
+
+def get_hbase_connection():
+    """Get HBase connection"""
+    global hbase_connection
+    if not HBASE_AVAILABLE:
+        return None
+
+    if hbase_connection is None:
+        try:
+            hbase_connection = happybase.Connection(
+                HBASE_CONFIG['host'],
+                HBASE_CONFIG['port']
+            )
+        except Exception as e:
+            print(f"[Database] Warning: Failed to connect to HBase: {e}")
+            return None
+
+    return hbase_connection

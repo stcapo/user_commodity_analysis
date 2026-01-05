@@ -32,12 +32,12 @@ services:
       zookeeper:
         condition: service_healthy
     ports:
-      - "9093:9093"
+      - "19093:9093"
       - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -96,6 +96,33 @@ services:
       timeout: 5s
       retries: 5
     command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+
+  # ============================================
+  # HBase - Distributed NoSQL Database
+  # ============================================
+  hbase:
+    image: bde2020/hbase-standalone:latest
+    container_name: hbase
+    ports:
+      - "16010:16010"
+      - "19090:9090"
+    environment:
+      HBASE_CONF_hbase_rootdir: file:///hbase
+      HBASE_CONF_hbase_zookeeper_quorum: zookeeper
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - hbase_data:/hbase
+      - ./init/hbase:/docker-entrypoint-initdb.d
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:16010"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   # ============================================
   # Kafka Producer - Simulates E-commerce Data
@@ -197,3 +224,4 @@ volumes:
   kafka_data:
   mysql_data:
   redis_data:
+  hbase_data:
